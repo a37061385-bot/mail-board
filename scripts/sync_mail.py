@@ -3,10 +3,11 @@
 
 GitHub Actions 러너에서 30분마다 돌아,
    1) 기존 data.enc.json 을 MAILBOARD_PIN 으로 복호화해 지금 상태를 읽고,
-   2) mail.chunil.co.kr 에 로그인해 **로그인 사용자(이름·메일·부서)** 를 먼저 읽고,
-   3) 받은편지함·보낸편지함의 새 메일만 가져와,
-   4) Gemini API 로 요약·할 일·기한·회신 필요 여부·답장 3톤을 만들고,
-   5) build_data.py 와 같은 형식(v2 gzip + PBKDF2-SHA256 10만 회 + AES-256-GCM)으로
+   2) mail.chunil.co.kr 에 로그인해 **사내 주소록(조직도+개인주소록)** 이 비어 있으면 받아 두고,
+   3) **로그인 사용자(이름·메일·부서·직급)** 를 먼저 읽고(주소록의 본인 항목으로 보완),
+   4) 받은편지함·보낸편지함의 새 메일만 가져와,
+   5) Gemini API 로 요약·할 일·기한·회신 필요 여부·답장 3톤을 만들고,
+   6) build_data.py 와 같은 형식(v2 gzip + PBKDF2-SHA256 10만 회 + AES-256-GCM)으로
       data.enc.json 을 다시 암호화한다.
 
 설계 원칙
@@ -33,9 +34,11 @@ GitHub Actions 러너에서 30분마다 돌아,
 사용
   MAILBOARD_PIN=**** python3 scripts/sync_mail.py --data-enc data.enc.json
   MAILBOARD_PIN=**** python3 scripts/sync_mail.py --dry-run          # 수집·분석만, 파일은 안 씀
+  MAILBOARD_PIN=**** python3 scripts/sync_mail.py --refresh-contacts # 사내 주소록을 새로 받아 갱신
   python3 scripts/sync_mail.py --selftest-roundtrip --data-enc data.enc.json
   python3 scripts/sync_mail.py --fixture-list _tmp/list.html --fixture-read _tmp/read.html
-  python3 scripts/sync_mail.py --owner-probe     # 로그인 사용자 인식만 확인(수집 안 함)
+  python3 scripts/sync_mail.py --owner-probe     # 로그인 사용자 인식만 확인(메일 수집 안 함)
+  python3 scripts/sync_mail.py --contacts-probe  # 사내 주소록 수집만 확인(몇 명 읽혔는지)
 """
 from __future__ import annotations
 
@@ -64,6 +67,15 @@ LOGIN_POST = BASE + "/login_ok.php"
 LIST_URL = BASE + "/mail_list.php"
 READ_URL = BASE + "/mail_read.php"
 MAIL_LINK = BASE + "/mail_read.php?mb_id=%s&mf_no=%s"
+
+# 사내 주소록(조직도 + 개인주소록) 화면 — 로그인 세션으로 그대로 긁는다
+#   address_group.php : 부서 그룹 트리(JS TreeNode) — 각 그룹의 그룹번호(mg_no/adg_no)와 이름
+#   member_list.php   : 조직도 그룹의 사내 구성원 목록(?s_mg_no=<그룹번호>&is_iframe=1, 20명/페이지)
+#   addr_list.php     : 개인주소록 그룹의 연락처 목록(?s_adg_no=<그룹번호>&is_iframe=1, 20건/페이지)
+GROUP_URL = BASE + "/address_group.php?type=G&tmp=tmp"
+MEMBER_LIST_PATH = "/member_list.php"
+ADDR_LIST_PATH = "/addr_list.php"
+CONTACT_KINDS = {"G": "org", "P": "personal", "S": "shared"}
 
 KST = dt.timezone(dt.timedelta(hours=9))
 DOMAIN = "chunil.co.kr"       # 사내 메일 도메인 — 메일 주소는 {CHUNIL_ID}@chunil.co.kr
@@ -207,6 +219,136 @@ def configure(owner: dict | None = None, cfg: dict | None = None) -> dict:
     return OWNER
 
 
+# ────────────────────────────────────────────────────────────── 사내 주소록 파서
+#  data["contacts"] 항목 구조(페이지가 읽는 키): {name, email, dept, kind, title}
+#    kind: org(조직도) · personal(개인주소록) — index.html 의 분류 규칙 설정이 이 값으로 구분한다.
+_CONTACT_TOTAL_RE = re.compile(r"전체\s*([\d,]+)\s*명")
+_TREE_NODE_RE = re.compile(
+    r"(newNode(?:_\d+)*)\s*=\s*(objTreeMenu_1|newNode(?:_\d+)*)\.addItem\(\s*"
+    r"new TreeNode\('((?:[^'\\]|\\.)*)'")
+_TREE_EVENT_RE = re.compile(r"addr_list_update\(\s*\\?['\"]([GPS])\\?['\"]\s*,\s*\\?['\"](\d+)")
+
+
+def contact_total(html: str) -> int:
+    """목록 화면의 `※ 전체 N명` → N (모르면 0)."""
+    m = _CONTACT_TOTAL_RE.search(_clean(html or ""))
+    if not m:
+        return 0
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+
+
+def parse_contact_tree(html: str) -> list[dict]:
+    """주소록 그룹 트리 → [{no, name, kind, depth}] (kind: org/personal/shared).
+
+    마크업은 JS 문자열이다 — `newNode_4_1 = newNode_4.addItem(new TreeNode('CMF파견', ...` 다음 줄의
+    `parent.addr_list_update(\'G\', \'310\', ...)` 가 그 그룹의 종류(G/P/S)와 그룹번호다.
+    변수 이름이 조직도·개인주소록에서 다시 쓰이므로(parent=objTreeMenu_1 이면 새 트리의 뿌리)
+    이름이 겹쳐도 순서대로 덮어쓰며 읽으면 된다.
+    """
+    lines = (html or "").splitlines()
+    nodes: dict[str, dict] = {}
+    out: list[dict] = []
+    for i, line in enumerate(lines):
+        m = _TREE_NODE_RE.search(line)
+        if not m:
+            continue
+        var, parent, raw_name = m.group(1), m.group(2), m.group(3)
+        name = _clean(raw_name.replace("\\'", "'").replace('\\"', '"'))
+        kind, no = "", ""
+        for nxt in lines[i + 1: i + 5]:
+            ev = _TREE_EVENT_RE.search(nxt)
+            if ev:
+                kind, no = CONTACT_KINDS.get(ev.group(1), ""), ev.group(2)
+                break
+        depth = 0 if parent == "objTreeMenu_1" else nodes.get(parent, {}).get("depth", 0) + 1
+        nodes[var] = {"name": name, "kind": kind, "no": no, "depth": depth}
+        if kind and no:
+            out.append({"no": no, "name": name, "kind": kind, "depth": depth})
+    return out
+
+
+def parse_org_contacts(html: str) -> list[dict]:
+    """member_list.php(조직도) → [{name, title, email}] — 직위 칸은 서버에 비어 있는 경우가 많다."""
+    rows: list[dict] = []
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tr in soup.find_all("tr"):
+        if tr.find("input", attrs={"name": "chk_m_no[]"}) is None:
+            continue
+        cells = tr.find_all("td", recursive=False)
+        if len(cells) < 4:
+            continue
+        name = _clean(cells[1].get_text(" ", strip=True))
+        title = _clean(cells[2].get_text(" ", strip=True))
+        email = _addr_email(cells[3].get_text(" ", strip=True)) or _addr_email(str(cells[3]))
+        if not name and not email:
+            continue
+        rows.append({"name": name, "title": title, "email": email})
+    return rows
+
+
+def parse_personal_contacts(html: str) -> list[dict]:
+    """addr_list.php(개인주소록) → [{name, email, group}] (외부 담당자·협력사가 대부분)."""
+    rows: list[dict] = []
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tr in soup.find_all("tr"):
+        if tr.find("input", attrs={"name": "chk_ad_no[]"}) is None:
+            continue
+        cells = tr.find_all("td", recursive=False)
+        if len(cells) < 4:
+            continue
+        group = _clean(cells[1].get_text(" ", strip=True))
+        name = _clean(cells[2].get_text(" ", strip=True))
+        email = _addr_email(cells[3].get_text(" ", strip=True)) or _addr_email(str(cells[3]))
+        if not name and not email:
+            continue
+        rows.append({"name": name, "email": email, "group": group})
+    return rows
+
+
+def merge_contacts(org: list[dict], personal: list[dict]) -> list[dict]:
+    """조직도·개인주소록을 한 목록으로 — 같은 메일은 한 줄(조직도 우선), 개인주소록은 조직도 중복 제외."""
+    out: list[dict] = []
+    by_email: dict[str, dict] = {}
+
+    def put(rec: dict, kind: str) -> None:
+        name = _clean(rec.get("name") or "")
+        email = (rec.get("email") or "").strip().lower()
+        dept = _clean(rec.get("dept") or "")
+        title = _clean(rec.get("title") or "")
+        if not name and not email:
+            return
+        cur = by_email.get(email) if email else None
+        if cur is not None:
+            if not cur.get("dept") and dept:
+                cur["dept"] = dept
+            if not cur.get("title") and title:
+                cur["title"] = title
+            if name and (not cur.get("name") or "@" in cur["name"]):
+                cur["name"] = name
+            return
+        item = {"name": name, "email": email, "dept": dept, "kind": kind, "title": title}
+        out.append(item)
+        if email:
+            by_email[email] = item
+
+    for rec in org:
+        put(rec, "org")
+    for rec in personal:
+        put(rec, "personal")
+    return out
+
+
+def contact_dept(name: str) -> str:
+    """그룹 이름 → 부서명. 조직도에 있는 '-'·'.' 같은 자리표시 그룹은 부서가 아니다."""
+    cleaned = _clean(name or "")
+    if not cleaned or not re.search(r"[0-9A-Za-z가-힣]", cleaned):
+        return ""
+    return cleaned
+
+
 def load_board_config(path: str | None = None) -> dict:
     """board_config.json → 분류 설정. 파일이 없으면 사내 표준 기본값을 쓴다."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -277,22 +419,47 @@ def parse_profile(html: str) -> dict:
     return out
 
 
+def find_self_in_contacts(contacts: list | None, corp_email: str, name: str = "") -> dict | None:
+    """사내 주소록에서 로그인 사용자 항목을 찾는다 — 사내 메일 일치 우선, 없으면 사내 메일 + 이름 일치.
+
+    개인정보 페이지의 '메일'은 외부 복구 메일(hanmail.net 등)일 수 있어 그 주소로는 주소록을
+    찾지 못한다. 그래서 `{아이디}@chunil.co.kr` 로 먼저 찾고, 없을 때만 이름으로 한 번 더 본다.
+    """
+    book = [c for c in (contacts or []) if isinstance(c, dict)]
+    target = (corp_email or "").strip().lower()
+    if target:
+        for c in book:
+            if (c.get("email") or "").strip().lower() == target:
+                return c
+    base = re.sub(r"\s+", "", split_name_title(name or "")[0] or _clean(name or ""))
+    if len(base) >= 2:
+        for c in book:
+            if not (c.get("email") or "").lower().endswith("@" + DOMAIN):
+                continue
+            cname = re.sub(r"\s+", "", c.get("name") or "")
+            if cname == base or (len(base) >= 3 and cname.startswith(base)):
+                return c
+    return None
+
+
 def detect_owner(nm: "Nmail", chunil_id: str, *, contacts: list | None = None,
                  data: dict | None = None) -> dict:
     """로그인 사용자를 웹메일에서 읽는다 → data.owner {name,title,dept,company,email}.
 
-    순서: 개인정보 페이지 → 상단 프로필 → 주소록 → 기존 data.owner → 아이디.
+    순서: 개인정보 페이지 → 상단 프로필 → **사내 주소록(본인 항목)** → 기존 data.owner → 아이디.
+    owner['email'] 은 언제나 사내 메일(`{아이디}@chunil.co.kr`)이다 — 개인정보 페이지가 알려주는
+    외부 복구 메일(hanmail.net 등)은 쓰지 않는다. To 판정·본문 지목 판정이 이 주소로 이뤄진다.
     하나도 못 읽어도 수집은 계속된다(이름이 비면 지목 판정만 꺼진다).
     """
-    owner = {"name": "", "title": "", "dept": "", "company": DEFAULT_COMPANY,
-             "email": f"{chunil_id}@{DOMAIN}".lower() if chunil_id else ""}
+    corp = f"{chunil_id}@{DOMAIN}".lower() if chunil_id else ""
+    owner = {"name": "", "title": "", "dept": "", "company": DEFAULT_COMPANY, "email": corp}
     prof: dict = {}
     try:
         prof = parse_profile(nm.profile_page())
     except Exception as e:  # noqa: BLE001 - 화면 구조가 달라도 계속
         if os.environ.get("SYNC_DEBUG"):
             print(f"  · 개인정보 페이지 읽기 실패: {type(e).__name__}: {e}", file=sys.stderr)
-    for k in ("name", "dept", "title", "email"):
+    for k in ("name", "dept", "title"):
         if prof.get(k):
             owner[k] = prof[k]
 
@@ -304,12 +471,14 @@ def detect_owner(nm: "Nmail", chunil_id: str, *, contacts: list | None = None,
         owner["name"] = (ident.get("name") or "").strip()
         owner["dept"] = owner["dept"] or (ident.get("dept") or "").strip()
 
-    for c in contacts or []:
-        if (c.get("email") or "").lower() == owner["email"]:
-            owner["name"] = owner["name"] or (c.get("name") or "")
-            owner["dept"] = owner["dept"] or (c.get("dept") or "")
-            owner["title"] = owner["title"] or (c.get("title") or "")
-            break
+    # 사내 주소록의 본인 항목 — 부서·직급·이름을 보완한다(사내 주소록 직위 칸은 비어 있을 수 있다).
+    hit = find_self_in_contacts(contacts, corp, owner["name"])
+    if hit:
+        owner["name"] = owner["name"] or (hit.get("name") or "")
+        owner["dept"] = owner["dept"] or (hit.get("dept") or "")
+        owner["title"] = owner["title"] or (hit.get("title") or "")
+        if not owner["email"]:
+            owner["email"] = (hit.get("email") or "").lower()
 
     prev = (data or {}).get("owner")
     if isinstance(prev, dict):
@@ -322,7 +491,7 @@ def detect_owner(nm: "Nmail", chunil_id: str, *, contacts: list | None = None,
         n2, t2 = split_name_title(owner["name"])
         if t2:
             owner["name"], owner["title"] = n2, t2
-    owner["email"] = (owner["email"] or "").lower()
+    owner["email"] = (corp or owner["email"] or "").lower()   # 사내 메일 우선(외부 복구 메일은 버림)
     return owner
 
 
@@ -500,6 +669,94 @@ class Nmail:
         name = _clean(box.get_text(" ", strip=True))
         name = re.sub(r"[\u25b2\u25bc\u25be\u25b4\s]+$", "", name).strip()
         out["name"] = name
+        return out
+
+    # -- 사내 주소록(조직도 + 개인주소록) ------------------------------------
+    def contact_group_tree(self) -> list[dict]:
+        """주소록 그룹 트리(address_group.php) → 조직도·개인주소록 그룹 목록."""
+        r = self._get(GROUP_URL)
+        self._dump("address_group.html", r.text)
+        if "login.php?back_url" in r.text or "login.php" in (r.url or ""):
+            raise NmailError("주소록 화면이 로그인 페이지로 돌아갔습니다 (세션 만료)")
+        groups = parse_contact_tree(r.text)
+        if not groups:
+            raise NmailError("주소록 그룹 트리를 읽지 못했습니다 (화면 구조 변경?)")
+        return groups
+
+    def contact_rows(self, path: str, param: str, no: str, *, kind: str,
+                     max_pages: int = 20, pause: float = 0.25) -> list[dict]:
+        """한 그룹의 명단을 끝까지(20건/페이지) 읽는다.
+
+        path: /member_list.php(조직도) · /addr_list.php(개인주소록), param: s_mg_no · s_adg_no
+        """
+        rows: list[dict] = []
+        total = 0
+        for page in range(1, max_pages + 1):
+            url = f"{BASE}{path}?{param}={no}&is_iframe=1" + (f"&pageID={page}" if page > 1 else "")
+            r = self._get(url)
+            if page == 1:
+                self._dump(f"contacts_{kind}_{no}_p1.html", r.text)
+                total = contact_total(r.text)
+            if "login.php?back_url" in r.text:
+                raise NmailError("주소록 목록이 로그인 페이지로 돌아갔습니다 (세션 만료)")
+            batch = parse_org_contacts(r.text) if kind == "org" else parse_personal_contacts(r.text)
+            if not batch:
+                break
+            rows.extend(batch)
+            if not total or len(rows) >= total:
+                break
+            time.sleep(pause)
+        return rows
+
+    def fetch_contacts(self, *, pause: float = 0.25, max_groups: int = 400,
+                       report: dict | None = None) -> list[dict]:
+        """사내 주소록 전체(조직도 + 개인주소록)를 읽어 data["contacts"] 형식으로 돌려준다.
+
+        조직도는 부서 그룹마다 명단을 받아 그룹 이름을 dept 로 붙인다(서버 주소록에 직위 칸이 비어
+        있어 직급은 이름에 붙은 표기에서만 얻어진다). 개인주소록은 조직도와 같은 메일은 버리고
+        외부 담당자·협력사만 남긴다. 실패는 호출하는 쪽에서 경고로 처리한다.
+        """
+        groups = self.contact_group_tree()
+        org_groups = [g for g in groups if g["kind"] == "org" and g["no"] not in ("", "0")]
+        per_groups = [g for g in groups if g["kind"] == "personal" and g["no"] not in ("", "0")]
+
+        org: list[dict] = []
+        for g in org_groups[:max_groups]:
+            try:
+                got = self.contact_rows(MEMBER_LIST_PATH, "s_mg_no", g["no"], kind="org", pause=pause)
+            except NmailError:
+                raise
+            except Exception as e:  # noqa: BLE001 - 한 그룹 실패가 전체를 멈추지 않게
+                got = []
+                if report is not None:
+                    report.setdefault("warnings", []).append(
+                        f"주소록 그룹 '{g['name']}'(mg_no={g['no']}) 읽기 실패: {type(e).__name__}")
+            org.extend({**row, "dept": contact_dept(g["name"])} for row in got)
+            time.sleep(pause)
+
+        personal: list[dict] = []
+        for g in per_groups:
+            try:
+                got = self.contact_rows(ADDR_LIST_PATH, "s_adg_no", g["no"], kind="personal", pause=pause)
+            except NmailError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                got = []
+                if report is not None:
+                    report.setdefault("warnings", []).append(
+                        f"개인주소록 '{g['name']}'(adg_no={g['no']}) 읽기 실패: {type(e).__name__}")
+            personal.extend({**row, "dept": contact_dept(g["name"])} for row in got)
+            time.sleep(pause)
+
+        out = merge_contacts(org, personal)
+        if report is not None:
+            report["contacts"] = {
+                "org": sum(1 for c in out if c["kind"] == "org"),
+                "personal": sum(1 for c in out if c["kind"] == "personal"),
+                "total": len(out), "groups": len(org_groups) + len(per_groups),
+            }
+        if not out:
+            raise NmailError("주소록에서 이름·메일을 하나도 읽지 못했습니다")
         return out
 
     def seed_mailbox(self, box: str, *, days: int = 14, limit: int = 30) -> list[dict]:
@@ -1190,7 +1447,6 @@ def sync(args: argparse.Namespace) -> dict:
     enc_path = args.data_enc
     data, is_new = load_or_init(enc_path, pin, seed_days=seed_days)
     items = data.setdefault("items", [])
-    contacts = load_contacts(data)
     base = max_mf_no(data)
     now = kst_now()
     report: dict[str, Any] = {"base_mf_no": base, "new_inbox": [], "new_sent": [], "replied": [],
@@ -1199,6 +1455,20 @@ def sync(args: argparse.Namespace) -> dict:
 
     nm = Nmail(args.chunil_id, args.chunil_pw, ip_check=args.ip_check, debug_dir=args.dump_dir)
     nm.login()
+
+    # 사내 주소록(조직도 + 개인주소록) — 비어 있거나 --refresh-contacts 면 새로 받아 둔다.
+    #  실패해도 메일 동기화는 그대로 진행한다(발신자 이름·부서 보완만 못 할 뿐).
+    contacts_added = 0
+    if getattr(args, "refresh_contacts", False) or not data.get("contacts"):
+        try:
+            fetched = nm.fetch_contacts(report=report)
+        except Exception as e:  # noqa: BLE001 - 주소록 실패가 동기화를 막지 않는다
+            fetched = []
+            report["warnings"].append(f"사내 주소록 수집 실패: {type(e).__name__}: {str(e)[:200]}")
+        if fetched:
+            data["contacts"] = fetched
+            contacts_added = len(fetched)
+    contacts = load_contacts(data)
 
     # 로그인 사용자를 먼저 읽고 분류 규칙을 세운다(이름·메일·부서·VIP).
     owner = detect_owner(nm, args.chunil_id, contacts=data.get("contacts"), data=data)
@@ -1224,7 +1494,7 @@ def sync(args: argparse.Namespace) -> dict:
     report["new_inbox"] = [{"mf_no": m["mf_no"], "subject": m["subject"], "receivedAt": m["receivedAt"]} for m in inbox]
     report["new_sent"] = [{"mf_no": m["mf_no"], "subject": m["subject"], "receivedAt": m["receivedAt"]} for m in sent]
 
-    if not inbox and not sent and not is_new:
+    if not inbox and not sent and not is_new and not contacts_added:
         report["changed"] = False
         return report
 
@@ -1270,7 +1540,8 @@ def sync(args: argparse.Namespace) -> dict:
         if hit:
             report["replied"].append({"sent_mf_no": row["mf_no"], "target": hit["id"], "subject": detail["subject"][:60]})
 
-    changed = bool(added or report["replied"] or any(m.get("merged_into") for m in report["new_inbox"]))
+    changed = bool(added or report["replied"] or contacts_added
+                   or any(m.get("merged_into") for m in report["new_inbox"]))
     if is_new:
         changed = True      # 첫 실행이면 메일이 0건이어도 보드를 만든다(페이지가 열리도록)
     report["changed"] = changed
@@ -1290,12 +1561,14 @@ def sync(args: argparse.Namespace) -> dict:
             f"{stamp} (KST) 최초 구축 — 최근 {seed_days}일 받은편지함 {len(inbox)}건을 읽어 {added}건 등록"
             f" · 보낸편지함 {len(sent)}건 대조(회신 반영 {len(report['replied'])}건)"
             f" · Gemini {report['gemini_calls']}회 호출"
+            + (f" · 사내 주소록 {contacts_added}명 수집" if contacts_added else "")
         )
     else:
         crit["verifiedAt"] = (
             f"{stamp} (KST) GitHub Actions 자동 갱신 — 받은편지함 신규 {len(inbox)}건 중 {added}건 추가"
             f"{'·스레드 병합 ' + str(len(inbox) - added) + '건' if len(inbox) > added else ''}"
             f" · 보낸편지함 신규 {len(sent)}건(회신 반영 {len(report['replied'])}건) · Gemini {report['gemini_calls']}회 호출"
+            + (f" · 사내 주소록 {contacts_added}명 재수집" if contacts_added else "")
         )
     # data.json 은 최신순 정렬(make_data.py 와 동일) — 대시보드가 위에서부터 최신으로 그린다
     items.sort(key=lambda it: (str(it.get("lastAt") or it.get("receivedAt") or ""), str(it.get("id"))),
@@ -1317,249 +1590,4 @@ def sync(args: argparse.Namespace) -> dict:
         os.replace(tmp, args.data_enc)
     report["written"] = tmp if args.out else args.data_enc
     report["size"] = os.path.getsize(report["written"])
-    report["plainBytes"] = out["plainBytes"]
-    return report
-
-
-def collect_images(nm: Nmail, imgs: list[dict], report: dict, *, cap_each: int = 300_000, max_n: int = 3) -> list[dict]:
-    """본문 인라인 이미지를 data URI 로 (최대 max_n장). 실패는 조용히 건너뛴다."""
-    out: list[dict] = []
-    for im in imgs:
-        if len(out) >= max_n:
-            break
-        blob = nm.fetch_bytes(im["src"], cap=cap_each)
-        if not blob:
-            continue
-        ctype = "image/jpeg"
-        head = blob[:12]
-        if head[:8] == b"\x89PNG\r\n\x1a\n":
-            ctype = "image/png"
-        elif head[:4] == b"GIF8":
-            ctype = "image/gif"
-        elif head[:4] == b"RIFF" and blob[8:12] == b"WEBP":
-            ctype = "image/webp"
-        out.append({"name": im.get("alt") or f"본문 이미지 {len(out) + 1}",
-                    "dataUrl": f"data:{ctype};base64,{base64.b64encode(blob).decode()}"})
-    return out
-
-
-def page_supports_gzip(data_enc_path: str) -> bool:
-    """같은 저장소의 index.html 이 gzip(v2) 해제를 지원하는지 확인 (build_data.py 와 같은 판단)."""
-    for cand in (os.path.join(os.path.dirname(os.path.abspath(data_enc_path)), "index.html"),
-                 os.path.join(os.getcwd(), "index.html"),
-                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "index.html")):
-        try:
-            with open(cand, encoding="utf-8") as f:
-                src = f.read()
-            return "gunzipBytes" in src and "DecompressionStream" in src
-        except OSError:
-            continue
-    return False
-
-
-# ────────────────────────────────────────────────────────────── 자체 검증
-def selftest_roundtrip(path: str, pin: str) -> int:
-    with open(path, encoding="utf-8") as f:
-        enc = json.load(f)
-    print(f"· 원본 {path}: v={enc.get('v')} comp={enc.get('comp')} iterations={enc.get('iterations')} "
-          f"plainBytes={enc.get('plainBytes')} size={os.path.getsize(path):,}")
-    payload = decrypt_payload(enc, pin)
-    items = payload.get("items", [])
-    print(f"· 복호화 OK — 항목 {len(items):,}건, updatedAt={payload.get('updatedAt')}, owner={payload.get('owner', {}).get('name')}")
-    print(f"· 최신 mf_no 기준점: {max_mf_no(payload)}")
-    again = encrypt_payload(payload, pin, compress=(enc.get("comp") == "gzip"))
-    back = decrypt_payload(again, pin)
-    same = json.dumps(payload, sort_keys=True, ensure_ascii=False) == json.dumps(back, sort_keys=True, ensure_ascii=False)
-    print(f"· 재암호화 라운드트립: {'일치' if same else '불일치'} (aes-gcm {again['cipher']}, comp={again['comp']}, {again['plainBytes']:,} bytes)")
-    keys_ok = set(again) == set(enc)
-    print(f"· 파일 키 구조: {'원본과 동일' if keys_ok else '다름 ' + str(set(again) ^ set(enc))}")
-    # build_data.py 와의 상호 호환 (build 가 만든 암호문을 우리가 읽을 수 있는지)
-    import subprocess, tempfile
-    here = os.path.dirname(os.path.abspath(path))
-    with tempfile.TemporaryDirectory() as td:
-        js = os.path.join(td, "data.json")
-        with open(js, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        env = dict(os.environ, MAILBOARD_PIN=pin)
-        res = subprocess.run([sys.executable, os.path.join(here, "build_data.py"), "--in", js,
-                              "--out", os.path.join(td, "d.enc.json")], capture_output=True, text=True, env=env)
-        ok_build = False
-        if res.returncode == 0:
-            with open(os.path.join(td, "d.enc.json"), encoding="utf-8") as f:
-                built = json.load(f)
-            ok_build = (json.dumps(decrypt_payload(built, pin), sort_keys=True) ==
-                        json.dumps(payload, sort_keys=True))
-        print(f"· build_data.py 호환: {'OK (암복호 왕복 일치)' if ok_build else '확인 실패 — ' + (res.stderr or res.stdout)[:300]}")
-    return 0 if (same and keys_ok) else 1
-
-
-def fixture_check(list_path: str | None, read_path: str | None) -> int:
-    rc = 0
-    if list_path:
-        with open(list_path, encoding="utf-8") as f:
-            rows = parse_list(f.read(), "inbox")
-        print(f"· 목록 파서: {len(rows)}행")
-        for r in rows[:6]:
-            print(f"   - {r['mf_no']} | {r['receivedAt']} | {r['size']} | unread={r['unread']} "
-                  f"attach={r['attach']} imp={r['important']} | {r['sender_raw']} | {r['subject'][:44]}")
-        if not rows:
-            print("   ! 파싱된 행이 없습니다")
-            rc = 1
-    if read_path:
-        with open(read_path, encoding="utf-8") as f:
-            d = parse_read(f.read())
-        print(f"· 본문 파서: 제목={d['subject'][:50]!r} 날짜={d['date']} 발신={d['from_raw'][:50]!r}")
-        print(f"   to={len(d['to'])} cc={len(d['cc'])} 첨부={[a['name'] + ' ' + a['size'] for a in d['attachments']]}")
-        print(f"   본문 {len(d['bodyText'])}자 / 인용 제거 후 {len(strip_quoted(d['bodyText']))}자 / "
-              f"지목={mentions_me(d['bodyText'])}")
-        if not d["subject"] or not d["date"]:
-            print("   ! 제목/날짜 파싱 실패")
-            rc = 1
-    return rc
-
-
-def _show_subjects() -> bool:
-    """공개 저장소의 Actions 로그에는 메일 제목이 남지 않도록 기본은 숨긴다.
-    내 PC에서 직접 돌릴 때만 SYNC_SHOW_SUBJECTS=1 로 켠다."""
-    return os.environ.get("SYNC_SHOW_SUBJECTS") == "1" and not os.environ.get("GITHUB_ACTIONS")
-
-
-def mask_report(report: dict) -> dict:
-    """--json 출력용 — 제목을 기본으로 마스킹한다."""
-    if _show_subjects():
-        return report
-    out = json.loads(json.dumps(report, ensure_ascii=False))
-    for key in ("new_inbox", "new_sent", "replied"):
-        for row in out.get(key) or []:
-            if row.get("subject"):
-                row["subject"] = f"mf-{row.get('mf_no', '?')}"
-    return out
-
-
-def write_github_output(report: dict) -> None:
-    path = os.environ.get("GITHUB_OUTPUT")
-    if not path:
-        return
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"changed={'true' if report.get('changed') else 'false'}\n")
-        f.write(f"new_count={len(report.get('new_inbox') or []) + len(report.get('new_sent') or [])}\n")
-        f.write(f"replied_count={len(report.get('replied') or [])}\n")
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Nmail → Gemini → data.enc.json 동기화")
-    ap.add_argument("--data-enc", default="data.enc.json", help="복호화·재암호화할 data.enc.json")
-    ap.add_argument("--out", default=None, help="출력 경로(기본: --data-enc 를 덮어씀)")
-    ap.add_argument("--dry-run", action="store_true", help="수집·분석만 하고 파일은 쓰지 않음")
-    ap.add_argument("--max-pages", type=int, default=3, help="편지함당 읽을 목록 페이지 수(100건/페이지)")
-    ap.add_argument("--max-new", type=int, default=40, help="한 번에 처리할 신규 메일 상한")
-    ap.add_argument("--no-thread-merge", dest="thread_merge", action="store_false", default=True,
-                    help="같은 제목 스레드 병합을 끄고 메일마다 항목 생성")
-    ap.add_argument("--no-track-replies", dest="track_replies", action="store_false", default=True,
-                    help="보낸편지함 대조(회신 완료 자동 전환)를 끔")
-    ap.add_argument("--images", dest="images", action="store_true", default=True,
-                    help="본문 인라인 이미지를 data URI 로 함께 저장(기본 켜짐)")
-    ap.add_argument("--no-images", dest="images", action="store_false")
-    ap.add_argument("--dump-dir", default=None, help="받은 HTML 을 저장할 디버그 폴더")
-    ap.add_argument("--selftest-roundtrip", action="store_true", help="현재 data.enc.json 복호화·재암호화 검증")
-    ap.add_argument("--fixture-list", default=None, help="목록 HTML 파일로 파서만 검증")
-    ap.add_argument("--fixture-read", default=None, help="편지읽기 HTML 파일로 파서만 검증")
-    ap.add_argument("--gemini-payload-test", action="store_true",
-                    help="Gemini 요청 본문(JSON) 구조만 확인 — 실제 호출은 하지 않는다")
-    ap.add_argument("--seed-days", type=int, default=14,
-                    help="첫 실행(빈 보드)에서 거슬러 올라갈 일수 — 기본 14일")
-    ap.add_argument("--seed-max", type=int, default=30,
-                    help="첫 실행에서 한 번에 가져올 받은편지함 건수 상한 — 기본 30건")
-    ap.add_argument("--board-config", default=None,
-                    help="분류 설정 파일 경로(기본: 저장소 루트 board_config.json)")
-    ap.add_argument("--owner-probe", action="store_true",
-                    help="로그인해 **사용자 인식(이름·메일·부서·VIP)** 결과만 출력하고 끝낸다")
-    ap.add_argument("--json", action="store_true", help="결과 요약을 JSON 으로 출력")
-    args = ap.parse_args(argv)
-    if args.owner_probe:
-        args.chunil_id = os.environ.get("CHUNIL_ID", "").strip()
-        args.chunil_pw = os.environ.get("CHUNIL_PW", "").strip()
-        if not (args.chunil_id and args.chunil_pw):
-            print("CHUNIL_ID / CHUNIL_PW 환경변수가 필요합니다.", file=sys.stderr)
-            return 2
-        nm = Nmail(args.chunil_id, args.chunil_pw,
-                   ip_check=os.environ.get("NMAIL_IP_CHECK", "1").strip())
-        nm.login()
-        owner = detect_owner(nm, args.chunil_id)
-        configure(owner, load_board_config(args.board_config))
-        print(json.dumps({"owner": OWNER, "vips": [list(v) for v in VIPS]}, ensure_ascii=False, indent=2))
-        return 0
-
-    pin = os.environ.get("MAILBOARD_PIN", "").strip()
-    if args.selftest_roundtrip:
-        if not pin:
-            print("MAILBOARD_PIN 환경변수가 필요합니다.", file=sys.stderr)
-            return 2
-        return selftest_roundtrip(args.data_enc, pin)
-    if args.fixture_list or args.fixture_read:
-        return fixture_check(args.fixture_list, args.fixture_read)
-    if args.gemini_payload_test:
-        sample = {"date": "2026-11-23 10:05", "from_raw": '"최수철" <csc7797@chunil.co.kr>',
-                  "to": ["김성규 <kimpro@chunil.co.kr>"], "cc": [], "subject": "공정이관 검토 요청",
-                  "bodyText": "검토 후 의견 부탁드립니다.", "attachments": [{"name": "검토.xlsx", "size": "12.3 KB"}]}
-        g = Gemini("DUMMY", os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL)
-        captured = {}
-        g._request = lambda p: captured.update(payload=p) or {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
-        g.analyze(sample)
-        print(json.dumps(captured["payload"], ensure_ascii=False, indent=2)[:4000])
-        return 0
-
-    args.chunil_id = os.environ.get("CHUNIL_ID", "").strip()
-    args.chunil_pw = os.environ.get("CHUNIL_PW", "").strip()
-    args.gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    args.gemini_model = (os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).strip()
-    args.ip_check = os.environ.get("NMAIL_IP_CHECK", "1").strip()
-    missing = [k for k, v in (("CHUNIL_ID", args.chunil_id), ("CHUNIL_PW", args.chunil_pw),
-                              ("MAILBOARD_PIN", pin)) if not v]
-    if missing:
-        print(f"환경변수 누락: {', '.join(missing)}", file=sys.stderr)
-        return 2
-    if not args.gemini_key:
-        msg = "GEMINI_API_KEY 가 없어 규칙 기반 대체 분석으로 실행합니다(요약 품질 저하)."
-        if os.environ.get("GITHUB_ACTIONS"):
-            print("오류: GitHub Actions 실행에서는 GEMINI_API_KEY 가 필요합니다. " + msg, file=sys.stderr)
-            return 2
-        print("경고: " + msg, file=sys.stderr)
-
-    try:
-        report = sync(args)
-    except NmailError as e:
-        print(f"웹메일 오류: {e}", file=sys.stderr)
-        return 3
-    except (GeminiError, ValueError, OSError) as e:
-        print(f"실행 오류: {e}", file=sys.stderr)
-        return 4
-
-    write_github_output(report)
-    if args.json:
-        print(json.dumps(mask_report(report), ensure_ascii=False, indent=2))
-    else:
-        print(f"[동기화] 기준 mf_no={report['base_mf_no']} · 신규 받은 {len(report['new_inbox'])}건"
-              f" · 신규 보낸 {len(report['new_sent'])}건 · 회신 반영 {len(report['replied'])}건"
-              f" · 변경={report.get('changed')} · Gemini {report['gemini_calls']}회"
-              + (" · 최초 구축" if report.get("init") else ""))
-        ow = report.get("owner") or {}
-        print(f"  · 로그인 사용자: {ow.get('name') or '?'} {ow.get('title') or ''} "
-              f"({ow.get('dept') or '부서 미확인'}) {ow.get('email') or ''}".rstrip())
-        if report.get("vips"):
-            print("  · VIP 등급: " + ", ".join(report["vips"]))
-        show = _show_subjects()
-        for row in report["new_inbox"]:
-            extra = f" {row.get('sender', '')} — {row['subject'][:60]}" if show else ""
-            print(f"  · [{row.get('priority', '?')}] mf_no={row['mf_no']} {row['receivedAt']}{extra}")
-        if not show and report["new_inbox"]:
-            print("  (제목은 공개 로그 노출 방지를 위해 표시하지 않습니다 · 로컬에서는 SYNC_SHOW_SUBJECTS=1)")
-        for w in report["warnings"]:
-            print("  ! " + w)
-        if report.get("written"):
-            print(f"  → {report['written']} ({report.get('size', 0):,} bytes)")
-    return 0 if not report["warnings"] else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    report["plainBytes"] = out["pla
