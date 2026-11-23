@@ -1590,4 +1590,266 @@ def sync(args: argparse.Namespace) -> dict:
         os.replace(tmp, args.data_enc)
     report["written"] = tmp if args.out else args.data_enc
     report["size"] = os.path.getsize(report["written"])
-    report["plainBytes"] = out["pla
+    report["plainBytes"] = out["plainBytes"]
+    return report
+
+
+def collect_images(nm: Nmail, imgs: list[dict], report: dict, *, cap_each: int = 300_000, max_n: int = 3) -> list[dict]:
+    """본문 인라인 이미지를 data URI 로 (최대 max_n장). 실패는 조용히 건너뛴다."""
+    out: list[dict] = []
+    for im in imgs:
+        if len(out) >= max_n:
+            break
+        blob = nm.fetch_bytes(im["src"], cap=cap_each)
+        if not blob:
+            continue
+        ctype = "image/jpeg"
+        head = blob[:12]
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            ctype = "image/png"
+        elif head[:4] == b"GIF8":
+            ctype = "image/gif"
+        elif head[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+            ctype = "image/webp"
+        out.append({"name": im.get("alt") or f"본문 이미지 {len(out) + 1}",
+                    "dataUrl": f"data:{ctype};base64,{base64.b64encode(blob).decode()}"})
+    return out
+
+
+def page_supports_gzip(data_enc_path: str) -> bool:
+    """같은 저장소의 index.html 이 gzip(v2) 해제를 지원하는지 확인 (build_data.py 와 같은 판단)."""
+    for cand in (os.path.join(os.path.dirname(os.path.abspath(data_enc_path)), "index.html"),
+                 os.path.join(os.getcwd(), "index.html"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "index.html")):
+        try:
+            with open(cand, encoding="utf-8") as f:
+                src = f.read()
+            return "gunzipBytes" in src and "DecompressionStream" in src
+        except OSError:
+            continue
+    return False
+
+
+# ────────────────────────────────────────────────────────────── 자체 검증
+def selftest_roundtrip(path: str, pin: str) -> int:
+    with open(path, encoding="utf-8") as f:
+        enc = json.load(f)
+    print(f"· 원본 {path}: v={enc.get('v')} comp={enc.get('comp')} iterations={enc.get('iterations')} "
+          f"plainBytes={enc.get('plainBytes')} size={os.path.getsize(path):,}")
+    payload = decrypt_payload(enc, pin)
+    items = payload.get("items", [])
+    print(f"· 복호화 OK — 항목 {len(items):,}건, updatedAt={payload.get('updatedAt')}, owner={payload.get('owner', {}).get('name')}")
+    print(f"· 최신 mf_no 기준점: {max_mf_no(payload)}")
+    again = encrypt_payload(payload, pin, compress=(enc.get("comp") == "gzip"))
+    back = decrypt_payload(again, pin)
+    same = json.dumps(payload, sort_keys=True, ensure_ascii=False) == json.dumps(back, sort_keys=True, ensure_ascii=False)
+    print(f"· 재암호화 라운드트립: {'일치' if same else '불일치'} (aes-gcm {again['cipher']}, comp={again['comp']}, {again['plainBytes']:,} bytes)")
+    keys_ok = set(again) == set(enc)
+    print(f"· 파일 키 구조: {'원본과 동일' if keys_ok else '다름 ' + str(set(again) ^ set(enc))}")
+    # build_data.py 와의 상호 호환 (build 가 만든 암호문을 우리가 읽을 수 있는지)
+    import subprocess, tempfile
+    here = os.path.dirname(os.path.abspath(path))
+    with tempfile.TemporaryDirectory() as td:
+        js = os.path.join(td, "data.json")
+        with open(js, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        env = dict(os.environ, MAILBOARD_PIN=pin)
+        res = subprocess.run([sys.executable, os.path.join(here, "build_data.py"), "--in", js,
+                              "--out", os.path.join(td, "d.enc.json")], capture_output=True, text=True, env=env)
+        ok_build = False
+        if res.returncode == 0:
+            with open(os.path.join(td, "d.enc.json"), encoding="utf-8") as f:
+                built = json.load(f)
+            ok_build = (json.dumps(decrypt_payload(built, pin), sort_keys=True) ==
+                        json.dumps(payload, sort_keys=True))
+        print(f"· build_data.py 호환: {'OK (암복호 왕복 일치)' if ok_build else '확인 실패 — ' + (res.stderr or res.stdout)[:300]}")
+    return 0 if (same and keys_ok) else 1
+
+
+def fixture_check(list_path: str | None, read_path: str | None) -> int:
+    rc = 0
+    if list_path:
+        with open(list_path, encoding="utf-8") as f:
+            rows = parse_list(f.read(), "inbox")
+        print(f"· 목록 파서: {len(rows)}행")
+        for r in rows[:6]:
+            print(f"   - {r['mf_no']} | {r['receivedAt']} | {r['size']} | unread={r['unread']} "
+                  f"attach={r['attach']} imp={r['important']} | {r['sender_raw']} | {r['subject'][:44]}")
+        if not rows:
+            print("   ! 파싱된 행이 없습니다")
+            rc = 1
+    if read_path:
+        with open(read_path, encoding="utf-8") as f:
+            d = parse_read(f.read())
+        print(f"· 본문 파서: 제목={d['subject'][:50]!r} 날짜={d['date']} 발신={d['from_raw'][:50]!r}")
+        print(f"   to={len(d['to'])} cc={len(d['cc'])} 첨부={[a['name'] + ' ' + a['size'] for a in d['attachments']]}")
+        print(f"   본문 {len(d['bodyText'])}자 / 인용 제거 후 {len(strip_quoted(d['bodyText']))}자 / "
+              f"지목={mentions_me(d['bodyText'])}")
+        if not d["subject"] or not d["date"]:
+            print("   ! 제목/날짜 파싱 실패")
+            rc = 1
+    return rc
+
+
+def _show_subjects() -> bool:
+    """공개 저장소의 Actions 로그에는 메일 제목이 남지 않도록 기본은 숨긴다.
+    내 PC에서 직접 돌릴 때만 SYNC_SHOW_SUBJECTS=1 로 켠다."""
+    return os.environ.get("SYNC_SHOW_SUBJECTS") == "1" and not os.environ.get("GITHUB_ACTIONS")
+
+
+def mask_report(report: dict) -> dict:
+    """--json 출력용 — 제목을 기본으로 마스킹한다."""
+    if _show_subjects():
+        return report
+    out = json.loads(json.dumps(report, ensure_ascii=False))
+    for key in ("new_inbox", "new_sent", "replied"):
+        for row in out.get(key) or []:
+            if row.get("subject"):
+                row["subject"] = f"mf-{row.get('mf_no', '?')}"
+    return out
+
+
+def write_github_output(report: dict) -> None:
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"changed={'true' if report.get('changed') else 'false'}\n")
+        f.write(f"new_count={len(report.get('new_inbox') or []) + len(report.get('new_sent') or [])}\n")
+        f.write(f"replied_count={len(report.get('replied') or [])}\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Nmail → Gemini → data.enc.json 동기화")
+    ap.add_argument("--data-enc", default="data.enc.json", help="복호화·재암호화할 data.enc.json")
+    ap.add_argument("--out", default=None, help="출력 경로(기본: --data-enc 를 덮어씀)")
+    ap.add_argument("--dry-run", action="store_true", help="수집·분석만 하고 파일은 쓰지 않음")
+    ap.add_argument("--max-pages", type=int, default=3, help="편지함당 읽을 목록 페이지 수(100건/페이지)")
+    ap.add_argument("--max-new", type=int, default=40, help="한 번에 처리할 신규 메일 상한")
+    ap.add_argument("--no-thread-merge", dest="thread_merge", action="store_false", default=True,
+                    help="같은 제목 스레드 병합을 끄고 메일마다 항목 생성")
+    ap.add_argument("--no-track-replies", dest="track_replies", action="store_false", default=True,
+                    help="보낸편지함 대조(회신 완료 자동 전환)를 끔")
+    ap.add_argument("--images", dest="images", action="store_true", default=True,
+                    help="본문 인라인 이미지를 data URI 로 함께 저장(기본 켜짐)")
+    ap.add_argument("--no-images", dest="images", action="store_false")
+    ap.add_argument("--dump-dir", default=None, help="받은 HTML 을 저장할 디버그 폴더")
+    ap.add_argument("--selftest-roundtrip", action="store_true", help="현재 data.enc.json 복호화·재암호화 검증")
+    ap.add_argument("--fixture-list", default=None, help="목록 HTML 파일로 파서만 검증")
+    ap.add_argument("--fixture-read", default=None, help="편지읽기 HTML 파일로 파서만 검증")
+    ap.add_argument("--gemini-payload-test", action="store_true",
+                    help="Gemini 요청 본문(JSON) 구조만 확인 — 실제 호출은 하지 않는다")
+    ap.add_argument("--seed-days", type=int, default=14,
+                    help="첫 실행(빈 보드)에서 거슬러 올라갈 일수 — 기본 14일")
+    ap.add_argument("--seed-max", type=int, default=30,
+                    help="첫 실행에서 한 번에 가져올 받은편지함 건수 상한 — 기본 30건")
+    ap.add_argument("--board-config", default=None,
+                    help="분류 설정 파일 경로(기본: 저장소 루트 board_config.json)")
+    ap.add_argument("--owner-probe", action="store_true",
+                    help="로그인해 **사용자 인식(이름·메일·부서·VIP)** 결과만 출력하고 끝낸다")
+    ap.add_argument("--refresh-contacts", action="store_true",
+                    help="사내 주소록(조직도+개인주소록)을 기존 내용과 관계없이 새로 받아 갱신한다")
+    ap.add_argument("--contacts-probe", action="store_true",
+                    help="로그인해 **사내 주소록 수집**만 실행해 몇 명을 읽었는지 확인하고 끝낸다")
+    ap.add_argument("--json", action="store_true", help="결과 요약을 JSON 으로 출력")
+    args = ap.parse_args(argv)
+    if args.contacts_probe or args.owner_probe:
+        args.chunil_id = os.environ.get("CHUNIL_ID", "").strip()
+        args.chunil_pw = os.environ.get("CHUNIL_PW", "").strip()
+        if not (args.chunil_id and args.chunil_pw):
+            print("CHUNIL_ID / CHUNIL_PW 환경변수가 필요합니다.", file=sys.stderr)
+            return 2
+        nm = Nmail(args.chunil_id, args.chunil_pw,
+                   ip_check=os.environ.get("NMAIL_IP_CHECK", "1").strip())
+        nm.login()
+        book: list[dict] = []
+        rep: dict = {"warnings": []}
+        try:
+            book = nm.fetch_contacts(report=rep)
+        except Exception as e:  # noqa: BLE001 - 사용자 인식만 확인할 때도 있으니 계속
+            print(f"주소록 수집 실패: {type(e).__name__}: {e}", file=sys.stderr)
+        owner = detect_owner(nm, args.chunil_id, contacts=book)
+        configure(owner, load_board_config(args.board_config))
+        print(json.dumps({"owner": OWNER, "contacts": rep.get("contacts") or {"total": len(book)},
+                          "vips": [list(v) for v in VIPS]}, ensure_ascii=False, indent=2))
+        for w in rep.get("warnings") or []:
+            print("  ! " + w, file=sys.stderr)
+        return 0
+
+    pin = os.environ.get("MAILBOARD_PIN", "").strip()
+    if args.selftest_roundtrip:
+        if not pin:
+            print("MAILBOARD_PIN 환경변수가 필요합니다.", file=sys.stderr)
+            return 2
+        return selftest_roundtrip(args.data_enc, pin)
+    if args.fixture_list or args.fixture_read:
+        return fixture_check(args.fixture_list, args.fixture_read)
+    if args.gemini_payload_test:
+        sample = {"date": "2026-11-23 10:05", "from_raw": '"최수철" <csc7797@chunil.co.kr>',
+                  "to": ["김성규 <kimpro@chunil.co.kr>"], "cc": [], "subject": "공정이관 검토 요청",
+                  "bodyText": "검토 후 의견 부탁드립니다.", "attachments": [{"name": "검토.xlsx", "size": "12.3 KB"}]}
+        g = Gemini("DUMMY", os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL)
+        captured = {}
+        g._request = lambda p: captured.update(payload=p) or {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+        g.analyze(sample)
+        print(json.dumps(captured["payload"], ensure_ascii=False, indent=2)[:4000])
+        return 0
+
+    args.chunil_id = os.environ.get("CHUNIL_ID", "").strip()
+    args.chunil_pw = os.environ.get("CHUNIL_PW", "").strip()
+    args.gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    args.gemini_model = (os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).strip()
+    args.ip_check = os.environ.get("NMAIL_IP_CHECK", "1").strip()
+    missing = [k for k, v in (("CHUNIL_ID", args.chunil_id), ("CHUNIL_PW", args.chunil_pw),
+                              ("MAILBOARD_PIN", pin)) if not v]
+    if missing:
+        print(f"환경변수 누락: {', '.join(missing)}", file=sys.stderr)
+        return 2
+    if not args.gemini_key:
+        msg = "GEMINI_API_KEY 가 없어 규칙 기반 대체 분석으로 실행합니다(요약 품질 저하)."
+        if os.environ.get("GITHUB_ACTIONS"):
+            print("오류: GitHub Actions 실행에서는 GEMINI_API_KEY 가 필요합니다. " + msg, file=sys.stderr)
+            return 2
+        print("경고: " + msg, file=sys.stderr)
+
+    try:
+        report = sync(args)
+    except NmailError as e:
+        print(f"웹메일 오류: {e}", file=sys.stderr)
+        return 3
+    except (GeminiError, ValueError, OSError) as e:
+        print(f"실행 오류: {e}", file=sys.stderr)
+        return 4
+
+    write_github_output(report)
+    if args.json:
+        print(json.dumps(mask_report(report), ensure_ascii=False, indent=2))
+    else:
+        print(f"[동기화] 기준 mf_no={report['base_mf_no']} · 신규 받은 {len(report['new_inbox'])}건"
+              f" · 신규 보낸 {len(report['new_sent'])}건 · 회신 반영 {len(report['replied'])}건"
+              f" · 변경={report.get('changed')} · Gemini {report['gemini_calls']}회"
+              + (" · 최초 구축" if report.get("init") else ""))
+        ow = report.get("owner") or {}
+        print(f"  · 로그인 사용자: {ow.get('name') or '?'} {ow.get('title') or ''} "
+              f"({ow.get('dept') or '부서 미확인'}) {ow.get('email') or ''}".rstrip())
+        if report.get("vips"):
+            print("  · VIP 등급: " + ", ".join(report["vips"]))
+        ct = report.get("contacts") or {}
+        if ct:
+            print(f"  · 사내 주소록: {ct.get('total', 0)}명 (조직도 {ct.get('org', 0)} · 개인 {ct.get('personal', 0)})"
+                  f" · 그룹 {ct.get('groups', 0)}개")
+        show = _show_subjects()
+        for row in report["new_inbox"]:
+            extra = f" {row.get('sender', '')} — {row['subject'][:60]}" if show else ""
+            print(f"  · [{row.get('priority', '?')}] mf_no={row['mf_no']} {row['receivedAt']}{extra}")
+        if not show and report["new_inbox"]:
+            print("  (제목은 공개 로그 노출 방지를 위해 표시하지 않습니다 · 로컬에서는 SYNC_SHOW_SUBJECTS=1)")
+        for w in report["warnings"]:
+            print("  ! " + w)
+        if report.get("written"):
+            print(f"  → {report['written']} ({report.get('size', 0):,} bytes)")
+    return 0 if not report["warnings"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
